@@ -2029,11 +2029,35 @@ export function getOrderedFusionChain(estimatedTokens: number, exactOutputReserv
 
 /**
  * Resolve an explicit model id (as a client would type it) to a fusion
- * candidate, or null when it isn't a known enabled model. Prefers an enabled
- * row; dedupes a model id that exists on multiple platforms by intelligence
- * rank, matching how /v1/models picks a representative row.
+ * candidate, or null when it isn't a known enabled model. Short unified group
+ * ids can use a keyed member even if a keyless provider owns the literal id.
+ * Full ids keep literal precedence; duplicate literal rows prefer a usable key.
  */
 export function resolveFusionCandidate(modelId: string): FusionCandidate | null {
+  // Flat unified pickers store a short canonical/group id. It can also be a
+  // raw id on a keyless relay, so resolve the logical group before that literal
+  // collision. Qualified/full model ids must keep their exact-match semantics.
+  if (isUnifyEnabled() && !/[/:]/.test(modelId)) {
+    const group = getModelGroups().find(g => g.canonicalId === modelId || g.groupKey === modelId);
+    if (group) {
+      const candidates = resolveModelGroupCandidates(group.members.map(m => m.model_db_id));
+      // Keep an already usable literal member stable; only cross providers
+      // when that literal collision cannot run with the configured keys.
+      const top = candidates.find(c => c.model_id === modelId && routableKeyIdsForModel(c.model_db_id).length > 0)
+        ?? candidates.find(c => routableKeyIdsForModel(c.model_db_id).length > 0)
+        ?? candidates.find(c => c.model_id === modelId)
+        ?? candidates[0];
+      if (top) return {
+        modelDbId: top.model_db_id,
+        platform: top.platform,
+        modelId: top.model_id,
+        displayName: top.display_name,
+        sizeLabel: top.size_label,
+        supportsVision: top.supports_vision,
+        supportsTools: top.supports_tools,
+      };
+    }
+  }
   const db = getDb();
   const rows = db.prepare(`
     SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name,
@@ -2065,8 +2089,8 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
 
   // Unify ON: a fusion picker value may be a canonical GROUP id rather than a
   // raw model_id. Resolve it to the group's best-ordered enabled member so
-  // saved fusion configs that use canonical ids keep working. Exact model_id
-  // match above always wins first, so OFF mode and legacy configs are untouched.
+  // saved fusion configs that use canonical ids keep working. Qualified IDs
+  // retain exact model_id precedence above; short group IDs are handled first.
   if (isUnifyEnabled()) {
     const resolved = resolveRequestedIdForDispatch(modelId, getModelGroups());
     if (resolved && resolved.memberDbIds.length > 0) {
