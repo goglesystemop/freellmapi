@@ -623,7 +623,7 @@ export interface RateLimitStatus {
 
 // ---- Provider Quota Observability ----
 
-export type QuotaMetric = 'requests' | 'tokens' | 'credits' | 'neurons';
+export type QuotaMetric = 'requests' | 'tokens' | 'output_tokens' | 'credits' | 'neurons';
 export type QuotaResetStrategy = 'fixed_calendar' | 'rolling_window' | 'token_bucket' | 'provider_reported' | 'unknown';
 export type QuotaObservationSource = 'header' | 'quota_api' | 'error_body' | 'local_usage' | 'documentation' | 'probe';
 

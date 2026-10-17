@@ -1146,6 +1146,13 @@ export function getCooldownDecisionForLimit(
       recentHitCount(platform, modelId, keyId, now) >= NULL_LIMIT_HIT_THRESHOLD;
   }
   const dailyExhausted = rpdExhausted || tpdExhausted;
+  // A valid provider delay is the retry time for a quota signal, not merely
+  // a floor on our 90s guess. Retain locally proven daily exhaustion: its
+  // independent counters will still reject a request after this bench expires.
+  // A 1s minimum prevents Retry-After: 0/past dates creating a tight loop.
+  if (quotaSignal && retryAfterMs != null && Number.isFinite(retryAfterMs) && retryAfterMs >= 0 && !dailyExhausted) {
+    return { durationMs: Math.min(Math.max(1000, retryAfterMs), DAY), source: 'authoritative' };
+  }
   let base = TRANSIENT_COOLDOWN_MS;
   if (dailyExhausted || heuristicallyExhausted) {
     // The ladder step is taken either way, so a route whose real limits get
@@ -1158,7 +1165,7 @@ export function getCooldownDecisionForLimit(
   // Honor an upstream Retry-After as a floor: never bench shorter than our own
   // heuristic, but extend (capped at a day) when the provider explicitly asks
   // to wait longer than we otherwise would.
-  if (retryAfterMs != null && retryAfterMs > base) {
+  if (retryAfterMs != null && Number.isFinite(retryAfterMs) && retryAfterMs > base) {
     return { durationMs: Math.min(retryAfterMs, DAY), source: 'authoritative' };
   }
   return { durationMs: base, source: 'heuristic' };
@@ -1448,6 +1455,7 @@ export function getRateLimitStatus(
     rpm: { used: requestCount(platform, modelId, keyId, MINUTE, now), limit: limits.rpm },
     rpd: { used: requestCount(platform, modelId, keyId, DAY, now), limit: limits.rpd },
     tpm: { used: tokenCount(platform, modelId, keyId, MINUTE, now), limit: limits.tpm },
+    tpd: { used: tokenCount(platform, modelId, keyId, DAY, now), limit: limits.tpd },
   };
 }
 
@@ -1480,6 +1488,9 @@ const LIMIT_AXIS_PATTERNS: Array<{ kind: LearnedLimitKind; re: RegExp }> = [
  */
 export function parseProviderLimit(message: string | undefined | null): LearnedLimit | null {
   if (!message) return null;
+  // Input/output-only quotas are different axes. Never overwrite a catalog
+  // total-token budget with an OTPM/ITPM (or per-day counterpart) ceiling.
+  if (/\b(?:input|output)\s+tokens?\s*per\s*(?:min(?:ute)?|day)|\b(?:otpm|itpm|otpd|itpd)\b/i.test(message)) return null;
   const m = message.match(/\blimit[:\s]+([\d,]+)/i);
   if (!m) return null;
   const limit = Number(m[1]!.replace(/,/g, ''));

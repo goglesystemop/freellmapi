@@ -139,9 +139,9 @@ describe('isDailyQuotaExhaustedError + midnight benching (drift: 90s cooldown on
     expect(Math.abs(duration - msUntilNextPacificMidnight())).toBeLessThan(1_000);
   });
 
-  it('keeps a Gemini per-minute violation on the transient cooldown', () => {
+  it('honors Gemini per-minute retry without applying a daily bench', () => {
     const err = Object.assign(new Error('Quota exceeded'), { status: 429, dailyQuotaExhausted: false, retryAfterMs: 17_000 });
-    expect(cooldownForError(fakeRoute({ platform: 'google' }), err)).toBe(90_000);
+    expect(cooldownForError(fakeRoute({ platform: 'google' }), err)).toBe(17_000);
   });
 
   it('flags real daily-allocation 429 bodies', () => {

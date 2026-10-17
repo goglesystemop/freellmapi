@@ -36,6 +36,10 @@ export function parseRetryAfterMs(value: string | null | undefined): number | un
   if (!value) return undefined;
   const trimmed = value.trim();
   if (/^\d+$/.test(trimmed)) return Math.min(Number(trimmed) * 1000, MAX_RETRY_AFTER_MS);
+  // Date.parse accepts surprising inputs such as "-1" and "1.5" as dates.
+  // Only HTTP-date shaped values may reach it; signed/fractional seconds and
+  // non-finite numbers are not valid HTTP Retry-After delta-seconds.
+  if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(trimmed)) return undefined;
   const when = Date.parse(trimmed);
   if (!Number.isNaN(when)) {
     return Math.min(Math.max(0, when - Date.now()), MAX_RETRY_AFTER_MS);
