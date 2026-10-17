@@ -209,6 +209,40 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  it('runs a saved canonical panel and judge using only the configured Groq provider', async () => {
+    const db = getDb();
+    db.exec('SAVEPOINT canonical_fusion');
+    try {
+      db.prepare("DELETE FROM api_keys WHERE platform != 'groq'").run();
+      db.prepare('UPDATE models SET enabled = 0').run();
+      const insert = db.prepare(`INSERT INTO models
+        (platform, model_id, display_name, intelligence_rank, speed_rank, enabled)
+        VALUES (?, ?, ?, ?, 1, 1) ON CONFLICT DO UPDATE SET enabled = 1, display_name = excluded.display_name, intelligence_rank = excluded.intelligence_rank`);
+      insert.run('ovh', 'gpt-oss-20b', 'GPT OSS 20B', 1);
+      insert.run('groq', 'openai/gpt-oss-20b', 'GPT OSS 20B', 2);
+      insert.run('electronhub', 'qwen3.8-27b', 'Qwen3.8 27B', 1);
+      insert.run('groq', 'qwen/qwen3.8-27b', 'Qwen3.8 27B', 2);
+      const saved = await request(app, 'PUT', '/api/settings/fusion', {
+        mode: 'explicit', models: ['gpt-oss-20b', 'qwen3.8-27b'],
+        judge: 'qwen3.8-27b', k: 2, strategy: 'synthesize', expose_panel: true,
+      });
+      expect(saved.status).toBe(200);
+      const { calls } = mockUpstreams({ 'api.groq.com': 'Groq answer' });
+      const response = await request(app, 'POST', '/v1/chat/completions', {
+        model: 'fusion', messages: [{ role: 'user', content: 'q' }],
+      }, authHeaders());
+      expect(response.status).toBe(200);
+      expect(response.body._fusion.synthesized).toBe(true);
+      expect(response.body._fusion.judge).toEqual({ platform: 'groq', model: 'qwen/qwen3.8-27b' });
+      const upstream = calls.filter(c => c.url.includes('api.groq.com'));
+      expect(upstream.map(c => c.body.model).sort()).toEqual([
+        'openai/gpt-oss-20b', 'qwen/qwen3.8-27b', 'qwen/qwen3.8-27b',
+      ]);
+    } finally {
+      db.exec('ROLLBACK TO canonical_fusion; RELEASE canonical_fusion');
+    }
+  });
+
   it('synthesizes one answer when ≥2 panel members succeed (judge runs)', async () => {
     mockUpstreams({
       'api.groq.com': 'groq says alpha',

@@ -22,6 +22,7 @@ describe('selectPanel vision filtering', () => {
   });
 
   beforeEach(() => {
+    initDb(':memory:');
     const db = getDb();
     db.prepare('DELETE FROM api_keys').run();
     db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
@@ -70,6 +71,41 @@ describe('selectPanel vision filtering', () => {
     } finally {
       db.prepare("DELETE FROM models WHERE model_id = 'edge-case-model'").run();
     }
+  });
+
+  it.each([
+    ['gpt-oss-20b', 'openai/gpt-oss-20b', 'ovh', 'GPT OSS 20B'],
+    ['qwen3.8-27b', 'qwen/qwen3.8-27b', 'electronhub', 'Qwen3.8 27B'],
+  ])('resolves canonical %s across differently named provider ids', (alias, full, relay, name) => {
+    const db = getDb();
+    db.prepare('UPDATE models SET enabled = 0').run();
+    const insert = db.prepare(`INSERT INTO models
+      (platform, model_id, display_name, intelligence_rank, speed_rank, enabled)
+      VALUES (?, ?, ?, ?, 1, 1) ON CONFLICT DO UPDATE SET enabled = 1, display_name = excluded.display_name, intelligence_rank = excluded.intelligence_rank`);
+    insert.run(relay, alias, name, 1);
+    insert.run('groq', full, name, 2);
+    expect(resolveFusionCandidate(alias)).toMatchObject({ platform: 'groq', modelId: full });
+    expect(resolveFusionCandidate(full)).toMatchObject({ platform: 'groq', modelId: full });
+    db.prepare("UPDATE api_keys SET model_scope_json = ? WHERE platform = 'groq'").run(JSON.stringify(['other-model']));
+    expect(resolveFusionCandidate(alias)?.platform).toBe(relay);
+    db.prepare("UPDATE api_keys SET model_scope_json = NULL, enabled = 0 WHERE platform = 'groq'").run();
+    expect(resolveFusionCandidate(alias)?.platform).toBe(relay);
+    db.prepare("UPDATE api_keys SET enabled = 1, status = 'unknown' WHERE platform = 'groq'").run();
+    expect(resolveFusionCandidate(alias)?.platform).toBe('groq');
+    db.prepare('UPDATE models SET enabled = 0 WHERE platform = ?').run('groq');
+    expect(resolveFusionCandidate(alias)?.platform).toBe(relay);
+  });
+
+  it('keeps full ids literal even when a different group member has a key', () => {
+    const db = getDb();
+    db.prepare('UPDATE models SET enabled = 0').run();
+    const insert = db.prepare(`INSERT INTO models
+      (platform, model_id, display_name, intelligence_rank, speed_rank, enabled)
+      VALUES (?, ?, 'Literal Test Model', 1, 1, 1)`);
+    insert.run('ovh', 'vendor/literal-test');
+    insert.run('groq', 'other/literal-test');
+    expect(resolveFusionCandidate('vendor/literal-test')).toMatchObject({ platform: 'ovh', modelId: 'vendor/literal-test' });
+    expect(resolveFusionCandidate('unknown-model')).toBeNull();
   });
 });
 

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Check, Layers, Search } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
-import { buildModelOptions } from '@/lib/model-groups'
+import { buildFusionModelOptions } from '@/lib/fusion-model-options'
 import { filterFusionModels, fusionProviders } from '@/lib/fusion-filter'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -70,7 +70,6 @@ export default function FusionPage() {
   // When unify is on, the panel/judge pickers offer ONE option per logical
   // model (value = canonical id); the fusion service resolves it to the group's
   // best member. When off, one option per provider row, as before.
-  const modelOptions = useMemo(() => buildModelOptions(availableModels, unifyOn), [availableModels, unifyOn])
 
   const [mode, setMode] = useState<Mode>('auto')
   const [models, setModels] = useState<string[]>([])
@@ -80,6 +79,10 @@ export default function FusionPage() {
   const [exposePanel, setExposePanel] = useState<boolean>(false)
   const [panelQuery, setPanelQuery] = useState('')
   const [panelProvider, setPanelProvider] = useState<string>(PROVIDER_ALL)
+  const modelOptions = useMemo(
+    () => buildFusionModelOptions(availableModels, unifyOn, [...models, judge]),
+    [availableModels, unifyOn, models, judge],
+  )
 
   // Issue #872: the explicit panel can list hundreds of models, so support a
   // free-text search and a provider filter before showing the rows.
