@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { getDb } from '../db/index.js';
 // Single shared Retry-After parser (was duplicated here and in providers/base.ts).
 import { parseRetryAfterMs } from '../providers/base.js';
+import { parseOutputRateLimit } from '../lib/output-rate-limit.js';
 import type {
   Platform,
   QuotaMetric,
@@ -455,6 +456,28 @@ export function recordQuotaObservation(input: QuotaObservationInput): ProviderQu
   };
 }
 
+/** Model/key-scoped evidence, deliberately separate from account total tokens.
+ * Retry-After says when to retry, NOT when a full minute's quota resets, so do
+ * not manufacture a balance reset or use this snapshot to throttle siblings. */
+export function recordOutputRateLimit(platform: Platform, keyId: number, modelId: string, err: { status?: number; message?: string; retryAfterMs?: number } | null | undefined): void {
+  if (err?.status !== 429) return;
+  const parsed = parseOutputRateLimit(err.message);
+  if (!parsed) return;
+  const retry = err.retryAfterMs;
+  try {
+    recordQuotaObservation({
+    platform, keyId, modelId, quotaPoolKey: `${platform}::model:${modelId}::output_tokens:minute`,
+    metric: 'output_tokens', limit: parsed.limit, remaining: Math.max(0, parsed.limit - parsed.used),
+    retryAfterMs: retry != null && Number.isFinite(retry) && retry >= 0 ? retry : null,
+    resetStrategy: 'unknown', source: 'error_body', statusCode: 429,
+    notes: `OTPM: used=${parsed.used}, requested=${parsed.requested}; retry hint is not a full-window reset`,
+    });
+  } catch {
+    // Optional evidence must never prevent the actual retry/cooldown policy
+    // from running when observation storage is unavailable.
+  }
+}
+
 export function recordQuotaObservationsFromResponse(
   response: Response,
   opts: Pick<QuotaObservationInput, 'platform' | 'modelId' | 'quotaPoolKey' | 'keyId' | 'providerAccountId' | 'endpoint'> = {},
@@ -510,6 +533,7 @@ export function getKeyQuotaHeadroom(platform: Platform): Map<number, number> {
                 THEN 1 ELSE 0 END AS expired
       FROM provider_quota_state
      WHERE platform = ?
+       AND metric != 'output_tokens'
        AND confidence >= ?
        AND limit_value IS NOT NULL
        AND limit_value > 0

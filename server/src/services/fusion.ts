@@ -1,3 +1,4 @@
+import { cooldownDecisionForError } from '../lib/provider-cooldown.js';
 import { z } from 'zod';
 import type { ChatMessage, ChatCompletionChoice, ChatCompletionResponse, ChatToolCall, TokenUsage } from '@freellmapi/shared/types.js';
 import {
@@ -7,8 +8,6 @@ import {
 } from './router.js';
 import {
   recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit,
-  getCooldownDecisionForLimit,
-  getPaymentRequiredCooldownMs, getModelForbiddenCooldownMs,
   learnLimitFromError, learnContextWindowFromError,
 } from './ratelimit.js';
 import { logRequest } from '../lib/request-log.js';
@@ -287,7 +286,7 @@ function addUsage(a: TokenUsage, b: TokenUsage | undefined): TokenUsage {
  * substitutes), or the auto-router for the judge (falls over across the chain).
  */
 async function runModelCall(
-  getRoute: (skipKeys: Set<string>, skipModels: Set<number>) => RouteResult | null,
+  getRoute: (skipKeys: Set<string>, skipModels: Set<number>, diagnostics?: string[]) => RouteResult | null,
   messages: ChatMessage[],
   options: CompletionOptions,
   estimatedTokens: number,
@@ -298,13 +297,14 @@ async function runModelCall(
 ): Promise<CallOutcome> {
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
+  const diagnostics: string[] = [];
   let lastError: string | undefined;
   let failure: CallFailure | undefined;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let route: RouteResult | null;
     try {
-      route = getRoute(skipKeys, skipModels);
+      route = getRoute(skipKeys, skipModels, diagnostics);
     } catch (err: any) {
       // routeRequest throws when the whole chain is exhausted (judge path).
       lastError = sanitizeProviderErrorMessage(err?.message);
@@ -367,11 +367,7 @@ async function runModelCall(
         // Provenance mirrors cooldownDecisionForError (lib/fallback-loop.ts):
         // credit/tier benches are never probe-recovered, Retry-After-backed
         // ones only when our heuristic outlasted the provider's own retry time.
-        const decision = isPaymentRequiredError(err)
-          ? { durationMs: getPaymentRequiredCooldownMs(), source: 'credit' as const }
-          : isModelAccessForbiddenError(err)
-          ? { durationMs: getModelForbiddenCooldownMs(), source: 'tier' as const }
-          : getCooldownDecisionForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs, { quotaSignal: isRateLimitSignal(err) });
+        const decision = cooldownDecisionForError(route, err);
         setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
         recordRateLimitHit(route.modelDbId);
         continue;
@@ -392,7 +388,7 @@ async function runModelCall(
       lastError = `request (~${estimatedTokens} tokens) does not fit this model's context window`;
     }
   }
-  return { ok: false, error: lastError ?? 'no available key for model', failure };
+  return { ok: false, error: lastError ?? (diagnostics.length ? sanitizeProviderErrorMessage(diagnostics.join('; ')) : 'no available key for model'), failure };
 }
 
 /**
@@ -403,7 +399,7 @@ async function runModelCall(
  * Usage is estimated (streaming rarely echoes a usage block).
  */
 async function runJudgeStreaming(
-  getRoute: (skipKeys: Set<string>, skipModels: Set<number>) => RouteResult | null,
+  getRoute: (skipKeys: Set<string>, skipModels: Set<number>, diagnostics?: string[]) => RouteResult | null,
   messages: ChatMessage[],
   options: CompletionOptions,
   estimatedTokens: number,
@@ -412,11 +408,12 @@ async function runJudgeStreaming(
 ): Promise<CallOutcome> {
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
+  const diagnostics: string[] = [];
   let lastError: string | undefined;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let route: RouteResult | null;
-    try { route = getRoute(skipKeys, skipModels); } catch (err: any) { lastError = sanitizeProviderErrorMessage(err?.message); break; }
+    try { route = getRoute(skipKeys, skipModels, diagnostics); } catch (err: any) { lastError = sanitizeProviderErrorMessage(err?.message); break; }
     if (!route) break;
     // A pinned judge keeps handing back its one model (see runModelCall).
     if (skipModels.has(route.modelDbId)) {
@@ -473,11 +470,7 @@ async function runJudgeStreaming(
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
         // Same provenance mapping as the non-stream path above.
-        const decision = isPaymentRequiredError(err)
-          ? { durationMs: getPaymentRequiredCooldownMs(), source: 'credit' as const }
-          : isModelAccessForbiddenError(err)
-          ? { durationMs: getModelForbiddenCooldownMs(), source: 'tier' as const }
-          : getCooldownDecisionForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs, { quotaSignal: isRateLimitSignal(err) });
+        const decision = cooldownDecisionForError(route, err);
         setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
         recordRateLimitHit(route.modelDbId);
         continue;
@@ -487,7 +480,7 @@ async function runJudgeStreaming(
       route.release?.();
     }
   }
-  return { ok: false, error: lastError ?? 'no available key for judge' };
+  return { ok: false, error: lastError ?? (diagnostics.length ? sanitizeProviderErrorMessage(diagnostics.join('; ')) : 'no available key for judge') };
 }
 
 /**
@@ -746,7 +739,7 @@ export async function runFusion(params: {
   // settles so a streaming client sees answers arrive one by one.
   const runSlot = (cand: FusionCandidate, slotOptions: CompletionOptions = options): Promise<PanelAnswer> =>
     runModelCall(
-      (skipKeys) => routePinnedModel(cand.modelDbId, estimatedTokens, skipKeys),
+      (skipKeys, _skipModels, diagnostics) => routePinnedModel(cand.modelDbId, estimatedTokens, skipKeys, diagnostics),
       messages, slotOptions, estimatedTokens, MAX_SLOT_ATTEMPTS,
       () => pinnedModelFitsRequestSize(cand.modelDbId, estimatedTokens) ? 'rate_limited' : 'context_too_large',
     ).then((outcome): PanelAnswer => {
@@ -911,6 +904,7 @@ export async function runFusion(params: {
   let judgeModelLabel: string | null = null;
   let judgeRoute: { platform: string; model: string } | null = null;
   let synthesized = false;
+  let judgeError: string | undefined;
 
   if (textSurvivors.length < SYNTHESIS_QUORUM || strategy === 'best_of') {
     // One survivor, or best-of requested: return the strongest single answer
@@ -926,9 +920,9 @@ export async function runFusion(params: {
       : options;
 
     const getJudgeRoute = config.judge
-      ? (skipKeys: Set<string>) => {
+      ? (skipKeys: Set<string>, _skipModels: Set<number>, diagnostics?: string[]) => {
           const cand = resolveFusionCandidate(config.judge!);
-          return cand ? routePinnedModel(cand.modelDbId, judgeEstimate, skipKeys) : null;
+          return cand ? routePinnedModel(cand.modelDbId, judgeEstimate, skipKeys, diagnostics) : null;
         }
       : (skipKeys: Set<string>, skipModels: Set<number>) => routeRequest(
           judgeEstimate, skipKeys.size ? skipKeys : undefined, undefined, false, false,
@@ -962,6 +956,7 @@ export async function runFusion(params: {
       totalUsage = addUsage(totalUsage, judge.usage);
     } else {
       // Judge failed → best-of fallback rather than erroring the whole request.
+      judgeError = judge.error;
       finalText = textSurvivors.slice().sort((a, b) => (b.content!.length - a.content!.length))[0].content!;
     }
   }
@@ -992,6 +987,7 @@ export async function runFusion(params: {
       strategy,
       synthesized,
       judge: judgeModelLabel,
+      ...(judgeError ? { judge_error: judgeError } : {}),
       panel_requested: panel.map(p => p.modelId),
       dropped,
       panel: answers.map(a => ({

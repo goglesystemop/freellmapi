@@ -6,7 +6,7 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 import { isFusionModel, fusionConfigSchema, familyKey, diversifyChain } from '../../services/fusion.js';
 import { getOrderedFusionChain, setRoutingStrategy, getRoutingStrategy, type FusionCandidate } from '../../services/router.js';
 import * as router from '../../services/router.js';
-import { setCooldown, isOnCooldown } from '../../services/ratelimit.js';
+import { setCooldown, isOnCooldown, recordRequest, recordTokens } from '../../services/ratelimit.js';
 
 let dashToken = '';
 
@@ -106,7 +106,7 @@ function mockUpstreams(answers: Record<string, MockAnswer>, rateLimited: Set<str
 
 // Stage upstream HTTP errors by host ({ status, message } in the OpenAI error
 // shape), with optional successful answers for other hosts. Records every call.
-function mockUpstreamErrors(errors: Record<string, { status: number; message: string }>, answers: Record<string, string> = {}) {
+function mockUpstreamErrors(errors: Record<string, { status: number; message: string; retryAfter?: string }>, answers: Record<string, string> = {}) {
   const origFetch = global.fetch;
   const calls: string[] = [];
   vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
@@ -116,7 +116,7 @@ function mockUpstreamErrors(errors: Record<string, { status: number; message: st
       if (u.includes(host)) {
         const body = { error: { message: e.message } };
         return {
-          ok: false, status: e.status, statusText: 'error', headers: new Headers(),
+          ok: false, status: e.status, statusText: 'error', headers: new Headers(e.retryAfter ? { 'Retry-After': e.retryAfter } : {}),
           text: () => Promise.resolve(JSON.stringify(body)),
           json: () => Promise.resolve(body),
         } as any;
@@ -240,6 +240,80 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
       ]);
     } finally {
       db.exec('ROLLBACK TO canonical_fusion; RELEASE canonical_fusion');
+    }
+  });
+
+  it('honors a 3s OTPM retry and explains a cooling Fusion slot without dispatching it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const now = Date.now();
+    try {
+      const { calls } = mockUpstreamErrors({
+        'api.groq.com': { status: 429, retryAfter: '3', message: 'output tokens per minute (OTPM): Limit 1000, Used 999, Requested 48. Please try again in 2.8s.' },
+      }, { 'api.cerebras.ai': 'survivor' });
+      const body = { model: 'fusion', messages: [{ role: 'user', content: 'q' }], fusion: { models: [groqModel, cerebrasModel], expose_panel: true } };
+      const first = await request(app, 'POST', '/v1/chat/completions', body, authHeaders());
+      expect(first.status).toBe(200);
+      const cd = getDb().prepare('SELECT expires_at_ms, set_at_ms, source FROM rate_limit_cooldowns WHERE model_id=? ORDER BY set_at_ms DESC LIMIT 1').get(groqModel) as any;
+      expect(cd).toMatchObject({ source: 'authoritative' });
+      expect(cd.expires_at_ms - cd.set_at_ms).toBe(3000);
+      const groqCalls = () => calls.filter(u => u.includes('api.groq.com')).length;
+      expect(groqCalls()).toBe(1);
+      const second = await request(app, 'POST', '/v1/chat/completions', body, authHeaders());
+      expect(second.status).toBe(200);
+      expect(second.body.x_fusion.panel.find((p: any) => p.platform === 'groq').error).toContain('cooldown (retry in 3s)');
+      expect(groqCalls()).toBe(1);
+      vi.setSystemTime(now + 3001);
+      await request(app, 'POST', '/v1/chat/completions', body, authHeaders());
+      expect(groqCalls()).toBe(2);
+      const quota = getDb().prepare("SELECT metric,limit_value,key_id,model_id FROM provider_quota_observations WHERE metric='output_tokens' AND model_id=? LIMIT 1").get(groqModel);
+      expect(quota).toMatchObject({ metric: 'output_tokens', limit_value: 1000, model_id: groqModel });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('retains an explicit judge cooldown reason when falling back to panel answers', async () => {
+    const key = getDb().prepare("SELECT id FROM api_keys WHERE platform='groq'").get() as { id: number };
+    setCooldown('groq', groqModel, key.id, 3000, 'authoritative');
+    mockUpstreams({ 'api.cerebras.ai': 'panel one', 'openrouter.ai': 'panel two' });
+    const r = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'fusion', messages: [{ role: 'user', content: 'q' }],
+      fusion: { models: [cerebrasModel, openrouterModel], judge: groqModel, expose_panel: true },
+    }, authHeaders());
+    expect(r.status).toBe(200);
+    expect(r.body._fusion.synthesized).toBe(false);
+    expect(r.body.x_fusion.judge_error).toContain('cooldown (retry in');
+  });
+
+  it('explains a missing key instead of misreporting it as a cooldown', async () => {
+    getDb().prepare("DELETE FROM api_keys WHERE platform='groq'").run();
+    mockUpstreams({ 'api.cerebras.ai': 'survivor' });
+    const r = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'fusion', messages: [{ role: 'user', content: 'q' }], fusion: { models: [groqModel, cerebrasModel], expose_panel: true },
+    }, authHeaders());
+    const error = r.body.x_fusion.panel.find((p: any) => p.platform === 'groq').error;
+    expect(error).toContain('missing, disabled or unhealthy API key');
+    expect(error).not.toContain('cooldown');
+  });
+
+  it.each([
+    ['rpd_limit', 'daily request quota exhausted'],
+    ['tpm_limit', 'token rate limit'],
+    ['tpd_limit', 'daily token quota exhausted'],
+  ])('explains the %s quota gate', async (column, reason) => {
+    const db = getDb();
+    const original = db.prepare("SELECT rpd_limit,tpm_limit,tpd_limit FROM models WHERE platform='groq' AND model_id=?").get(groqModel) as any;
+    const key = db.prepare("SELECT id FROM api_keys WHERE platform='groq'").get() as any;
+    try {
+      db.prepare(`UPDATE models SET ${column}=? WHERE platform='groq' AND model_id=?`).run(column === 'tpm_limit' ? 10000 : 1, groqModel);
+      if (column === 'rpd_limit') recordRequest('groq', groqModel, key.id);
+      else recordTokens('groq', groqModel, key.id, column === 'tpm_limit' ? 10000 : 2);
+      mockUpstreams({ 'api.cerebras.ai': 'survivor' });
+      const r = await request(app, 'POST', '/v1/chat/completions', {
+        model: 'fusion', messages: [{ role: 'user', content: 'q' }], fusion: { models: [groqModel, cerebrasModel], expose_panel: true },
+      }, authHeaders());
+      expect(r.status).toBe(200);
+      expect(r.body.x_fusion.panel.find((p: any) => p.platform === 'groq').error).toContain(reason);
+    } finally {
+      db.prepare("UPDATE models SET rpd_limit=?,tpm_limit=?,tpd_limit=? WHERE platform='groq' AND model_id=?").run(original.rpd_limit,original.tpm_limit,original.tpd_limit,groqModel);
     }
   });
 

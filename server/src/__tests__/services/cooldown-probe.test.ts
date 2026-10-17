@@ -270,18 +270,17 @@ describe('cooldown provenance (cooldownDecisionForError)', () => {
     expect(decision.durationMs).toBe(90_000);
   });
 
-  it('a Retry-After that determined the expiry is authoritative; a shorter one is not', () => {
+  it('valid long and short Retry-After delays are authoritative and never probed early', () => {
     // Retry-After beyond our 90s transient bench: the provider's word set the
     // expiry, so probing early could never be justified.
     const longRetry = Object.assign(new Error('429 Too Many Requests'), { retryAfterMs: 10 * MINUTE });
     const long = cooldownDecisionForError(fakeRoute(), longRetry);
     expect(long).toEqual({ durationMs: 10 * MINUTE, source: 'authoritative' });
 
-    // Retry-After SHORTER than our bench: everything past the provider's own
-    // retry time is our pessimism, so early recovery stays on the table.
+    // A short stated retry replaces the guess and must not be probed early.
     const shortRetry = Object.assign(new Error('429 Too Many Requests'), { retryAfterMs: 1_000 });
     const short = cooldownDecisionForError(fakeRoute(), shortRetry);
-    expect(short).toEqual({ durationMs: 90_000, source: 'heuristic' });
+    expect(short).toEqual({ durationMs: 1_000, source: 'authoritative' });
   });
 });
 

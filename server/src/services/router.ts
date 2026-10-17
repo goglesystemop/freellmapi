@@ -14,6 +14,7 @@ import {
   releaseLease,
   getSoonestCooldownExpiry,
   modelWindowUsedFraction,
+  getActiveCooldownsForKeys, getRateLimitStatus,
 } from './ratelimit.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
@@ -1533,7 +1534,7 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
   ).all(entry.platform) as KeyRow[];
   if (allKeys.length === 0) {
-    diag?.push(`${label}: no enabled+healthy key for platform`);
+    diag?.push(`${label}: no enabled+healthy key for platform (missing, disabled or unhealthy API key)`);
     return null;
   }
 
@@ -1597,7 +1598,11 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
     if (skipKeys?.has(skipId)) { note('already-failed-this-request'); continue; }
 
-    if (isOnCooldown(entry.platform, entry.model_id, key.id)) { note('cooldown'); continue; }
+    if (isOnCooldown(entry.platform, entry.model_id, key.id)) {
+      const cooldown = getActiveCooldownsForKeys([key.id]).get(key.id)?.find(c => c.platform === entry.platform && c.modelId === entry.model_id);
+      note(cooldown ? `cooldown (retry in ${Math.max(1, Math.ceil(cooldown.remainingMs / 1000))}s)` : 'cooldown');
+      continue;
+    }
     if (!canUseProvider(entry.platform, key.id)) { note('provider-daily-cap'); continue; }
     // Account-wide per-minute budget, checked before the per-model gates: a model
     // with a NULL rpm_limit would otherwise sail past them and spend a budget its
@@ -1607,8 +1612,18 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     // parallel streams all pick the same key and 429 each other on providers that
     // meter concurrency per credential.
     if (!canUseKeyConcurrency(entry.platform, key.id)) { note('key-concurrency'); continue; }
-    if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) { note('rpm/rpd-limit'); continue; }
-    if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) { note('tpm/tpd-limit'); continue; }
+    if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) {
+      const status = getRateLimitStatus(entry.platform, entry.model_id, key.id, limits);
+      note(status.rpd.limit != null && status.rpd.used >= status.rpd.limit
+        ? 'rpm/rpd-limit (daily request quota exhausted)' : 'rpm/rpd-limit (request rate limit)');
+      continue;
+    }
+    if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) {
+      const status = getRateLimitStatus(entry.platform, entry.model_id, key.id, limits);
+      note(limits.tpd != null && status.tpd.used + estimatedTokens > limits.tpd
+        ? 'tpm/tpd-limit (daily token quota exhausted)' : 'tpm/tpd-limit (token rate limit)');
+      continue;
+    }
     if (!canUseProviderTokens(entry.platform, key.id, entry.model_id, estimatedTokens)) { note('provider-daily-token-cap'); continue; }
     // Monthly budget (#1158): a key whose request/token caps are spent for the
     // current UTC month is not a candidate — same skip semantics as the daily
@@ -1835,7 +1850,7 @@ export function fitsContextWindow(platform: string, contextWindow: number | null
  * silently collapsed onto whatever else is available. `skipKeys` lets a slot
  * exclude keys it already failed on this request.
  */
-export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skipKeys?: Set<string>): RouteResult | null {
+export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skipKeys?: Set<string>, diagnostics?: string[]): RouteResult | null {
   const db = getDb();
   const entry = getModelChainRow(db, modelDbId);
   if (!entry) return null;
@@ -1845,7 +1860,7 @@ export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skip
   // 400 is classified and retried downstream). Nothing is multiplied here —
   // estimatedTokens already carries the exact capped output reserve (#470).
   if (!rowFitsRequestSize(entry, estimatedTokens)) return null;
-  return selectKeyForModel(entry, estimatedTokens, skipKeys);
+  return selectKeyForModel(entry, estimatedTokens, skipKeys, diagnostics);
 }
 
 function rowFitsRequestSize(entry: ChainRow, estimatedTokens: number): boolean {

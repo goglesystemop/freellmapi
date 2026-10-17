@@ -17,7 +17,7 @@ export const BALANCE_MIN_WINDOW_MS = 60 * 60 * 1000
 export interface KeyBalance {
   remaining: number
   limit: number | null
-  metric: ProviderQuotaState['metric']
+  metric: Exclude<ProviderQuotaState['metric'], 'output_tokens'>
   /** remaining/limit, or null when the provider never reported a limit. */
   fraction: number | null
 }
@@ -25,6 +25,8 @@ export interface KeyBalance {
 export function balanceByKey(states: ProviderQuotaState[], now: number = Date.now()): Map<number, KeyBalance> {
   const out = new Map<number, KeyBalance>()
   for (const s of states) {
+    // Model-specific OTPM error evidence is not an account/daily balance.
+    if (s.metric === 'output_tokens') continue
     if (s.remaining == null) continue
     if (s.resetStrategy === 'token_bucket') continue
     if (s.resetAt) {

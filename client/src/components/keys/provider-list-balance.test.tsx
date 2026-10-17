@@ -38,6 +38,15 @@ it('picks the tightest pool per key and skips unreadable states', () => {
   expect(map.has(3)).toBe(false)
 })
 
+it('does not present a model OTPM snapshot as the whole key balance', () => {
+  const map = balanceByKey([
+    state({ keyId: 1, metric: 'output_tokens', limit: 1000, remaining: 1 }),
+    state({ keyId: 1, metric: 'tokens', limit: 8000, remaining: 4000 }),
+  ])
+  expect(map.get(1)?.metric).toBe('tokens')
+  expect(map.get(1)?.fraction).toBe(0.5)
+})
+
 it('prefers a limited pool over an unlimited one for the same key', () => {
   const map = balanceByKey([
     state({ keyId: 4, metric: 'credits', limit: null, remaining: 3 }),

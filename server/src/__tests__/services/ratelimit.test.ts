@@ -401,8 +401,8 @@ describe('Cooldown duration with upstream Retry-After', () => {
     expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits)).toBe(90_000);
   });
 
-  it('never benches shorter than the heuristic (ignores a shorter Retry-After)', () => {
-    expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits, 30_000)).toBe(90_000);
+  it('uses a shorter provider-stated retry instead of the heuristic', () => {
+    expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits, 30_000)).toBe(30_000);
   });
 
   it('honors a Retry-After longer than the heuristic', () => {
